@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMo
 from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, Filters
 from functools import lru_cache
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Constants ---
 TELEGRAM_BOT_TOKEN = "7575210959:AAFzqsnt7Gx3qMBxl4M9gzOFNsAFSKn2W2Q"
@@ -86,6 +86,25 @@ def calculate_adx(highs, lows, closes, period=14):
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     return dx.rolling(window=period).mean().iloc[-1]
 
+def calculate_rma(tr, period):
+    rma = [tr.iloc[0]]  # start with first TR
+    alpha = 1 / period
+    for i in range(1, len(tr)):
+        rma.append((1 - alpha) * rma[-1] + alpha * tr.iloc[i])
+    return pd.Series(rma, index=tr.index)
+
+
+def calculate_atr(highs, lows, closes, period=14):
+    df = pd.DataFrame({"High": highs, "Low": lows, "Close": closes})
+    df["H-L"] = df["High"] - df["Low"]
+    df["H-PC"] = abs(df["High"] - df["Close"].shift())
+    df["L-PC"] = abs(df["Low"] - df["Close"].shift())
+    tr = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
+    atr = calculate_rma(tr, period)
+    return atr.iloc[-1]
+
+
+
 def analyze_multi_tf(symbol, market):
     tf_map = [("15m", "15m"), ("1h", "1h"), ("4h", "4h"), ("1d", "1d")]
     rsi_info, macd_info = [], []
@@ -105,25 +124,33 @@ def analyze_multi_tf(symbol, market):
     return rsi_info, macd_info
 
 def get_btc_header():
-    from datetime import timedelta
-    import pandas as pd
-
-    TZ_OFFSET = +2  # Germany (CET in daylight)
+    TZ_OFFSET = +2  # Adjust to your local timezone
     market = "spot"
     symbol = "BTCUSDT"
-    tf_list = [("15m", 4), ("1h", 2), ("4h", 3), ("1d", 2)]
+    tf_list = [("5m", 2), ("15m", 3), ("1h", 3), ("4h", 2), ("1d", 2)]
 
     now_utc = datetime.utcnow()
     local_time = now_utc + timedelta(hours=TZ_OFFSET)
     now = local_time.strftime('%H:%M')
 
     lines = [f"*🧠 BTCUSDT Summary ({market.title()} {now} CET)*"]
+    atr_row = "*ATR Values:*"
+    rsi6_row = "*RSI-6 =*"
+
+    atr_period_map = {"5m": 14, "15m": 14, "1h": 10, "4h": 7, "1d": 7}
+
     for tf_label, N in tf_list:
         try:
             klines = fetch_klines(symbol, tf_label, market)
             closes = [float(k[4]) for k in klines]
+            highs = [float(k[2]) for k in klines]
+            lows = [float(k[3]) for k in klines]
+
             if len(closes) < 200:
                 lines.append(f"{tf_label}: Not enough data.")
+                atr_row += f" `{tf_label}=NA` 🔴 |"
+                if tf_label in ["5m", "15m", "1h"]:
+                    rsi6_row += f" {tf_label}=NA ⚪ |"
                 continue
 
             # === RSI & MACD ===
@@ -132,17 +159,15 @@ def get_btc_header():
             macd_val, signal_val = calculate_macd(closes)
             macd_dot = "🟢" if macd_val > signal_val else "🔴"
 
-            # === SMA7 / SMA25 Crossover (last N candles) ===
+            # === SMA7 / SMA25 Cross ===
             sma7_series = pd.Series(closes).rolling(window=7).mean()
             sma25_series = pd.Series(closes).rolling(window=25).mean()
             cross_7_25 = "⚪"
-
             for i in range(1, N + 1):
                 sma7_now = sma7_series.iloc[-i]
                 sma25_now = sma25_series.iloc[-i]
                 sma7_prev = sma7_series.iloc[-(i + 1)]
                 sma25_prev = sma25_series.iloc[-(i + 1)]
-
                 if sma7_now > sma25_now and sma7_prev <= sma25_prev:
                     cross_7_25 = f"🟢 ({i}c)"
                     break
@@ -150,17 +175,15 @@ def get_btc_header():
                     cross_7_25 = f"🔴 ({i}c)"
                     break
 
-            # === SMA50 / SMA200 Cross (last N candles) ===
+            # === SMA50 / SMA200 Cross ===
             sma50_series = pd.Series(closes).rolling(window=50).mean()
             sma200_series = pd.Series(closes).rolling(window=200).mean()
             cross_50_200 = "⚪"
-
             for i in range(1, N + 1):
                 sma50_now = sma50_series.iloc[-i]
                 sma200_now = sma200_series.iloc[-i]
                 sma50_prev = sma50_series.iloc[-(i + 1)]
                 sma200_prev = sma200_series.iloc[-(i + 1)]
-
                 if sma50_now > sma200_now and sma50_prev <= sma200_prev:
                     cross_50_200 = f"🟢 ({i}c)"
                     break
@@ -168,70 +191,158 @@ def get_btc_header():
                     cross_50_200 = f"🔴 ({i}c)"
                     break
 
-            # === Final Output ===
+            # === ATR ===
+            period = atr_period_map.get(tf_label, 14)
+            atr = calculate_atr(highs, lows, closes, period=period)
+            atr_ratio = atr / closes[-1]
+
+            if closes[-1] >= 100:
+                atr_dot = "🟢" if 0.0025 <= atr_ratio <= 0.015 else "🔴"
+            elif closes[-1] >= 1:
+                atr_dot = "🟢" if 0.01 <= atr_ratio <= 0.03 else "🔴"
+            else:
+                atr_dot = "🟢" if 0.02 <= atr_ratio <= 0.08 else "🔴"
+
+            atr_row += f" `{tf_label}={atr:.2f}` {atr_dot} |"
+
+            # === RSI-6 (Scalping Insight) ===
+            if tf_label in ["5m", "15m", "1h"]:
+                rsi6 = compute_rsi(closes, period=6)
+                rsi6_dot = "🟢" if rsi6 <= 30 else "🔴" if rsi6 >= 70 else "⚪"
+                rsi6_row += f" {tf_label}={rsi6:.1f} {rsi6_dot} |"
+
+            # === Final Summary Line ===
             lines.append(
-                f"{tf_label}: RSI={rsi_val:.1f} {rsi_dot}, "
-                f"MACD={macd_dot}, sma7x25={cross_7_25}, sma50x200={cross_50_200}"
+                f"{tf_label} 🕒 | "
+                f"RSI: {rsi_val:.1f} {rsi_dot} | "
+                f"MACD: {macd_dot} | "
+                f"7x25: {cross_7_25} | "
+                f"50x200: {cross_50_200}"
             )
 
         except Exception as e:
             lines.append(f"{tf_label}: Error - {e}")
+            atr_row += f" `{tf_label}=Err` 🔴 |"
+            if tf_label in ["5m", "15m", "1h"]:
+                rsi6_row += f" {tf_label}=Err ⚪ |"
 
+    lines.append("\n" + atr_row.rstrip("|"))
+    lines.append(rsi6_row.rstrip("|"))
     return "\n".join(lines) + "\n\n"
 
 
+
+
+# --- Symbol Filtering Logic ---
 # --- Symbol Filtering Logic ---
 def process_symbol(symbol, interval, market, filter_type, trend, sma_min=None, sma_max=None, sma_choice=None):
     try:
+        # === Fetch Kline Data ===
         klines = fetch_klines(symbol, interval, market)
         closes = [float(k[4]) for k in klines]
         highs = [float(k[2]) for k in klines]
         lows = [float(k[3]) for k in klines]
         volumes = [float(k[5]) for k in klines]
-        if len(closes) < 50: return None
+        if len(closes) < 60:  # Ensure enough candles
+            return None
 
-        sma7 = pd.Series(closes).rolling(window=7).mean().iloc[-1]
-        sma25 = pd.Series(closes).rolling(window=25).mean().iloc[-1]
-        sma50 = pd.Series(closes).rolling(window=50).mean().iloc[-1]
-        sma99 = pd.Series(closes).rolling(window=99).mean().iloc[-1]
-        sma200 = pd.Series(closes).rolling(window=200).mean().iloc[-1]
-        sma7_prev = pd.Series(closes).rolling(window=7).mean().iloc[-2]
-        sma25_prev = pd.Series(closes).rolling(window=25).mean().iloc[-2]
-        sma99_prev = pd.Series(closes).rolling(window=99).mean().iloc[-2]
+        # === Select SMA Periods Based on Interval ===
+        if interval in ["5m", "15m", "1h"]:
+            sma_fast_p, sma_slow_p, sma_third_p, sma_extra = 5, 10, 30, 60
+        else:
+            sma_fast_p, sma_slow_p, sma_third_p, sma_extra = 7, 25, 99, 200
+
+        # === Calculate SMA values ===
+        sma_fast = pd.Series(closes).rolling(window=sma_fast_p).mean().iloc[-1]
+        sma_slow = pd.Series(closes).rolling(window=sma_slow_p).mean().iloc[-1]
+        sma_third = pd.Series(closes).rolling(window=sma_third_p).mean().iloc[-1]
+        sma_extra_val = pd.Series(closes).rolling(window=sma_extra).mean().iloc[-1]
+
+        sma_fast_prev = pd.Series(closes).rolling(window=sma_fast_p).mean().iloc[-2]
+        sma_slow_prev = pd.Series(closes).rolling(window=sma_slow_p).mean().iloc[-2]
+        sma_third_prev = pd.Series(closes).rolling(window=sma_third_p).mean().iloc[-2]
 
         price = closes[-1]
-        sma_value = {'sma7': sma7, 'sma25': sma25, 'sma50': sma50, 'sma99': sma99, 'sma200': sma200}.get(sma_choice, sma25)
+        sma_value = {
+            'sma5': sma_fast, 'sma10': sma_slow, 'sma30': sma_third, 'sma60': sma_extra_val,
+            'sma7': sma_fast, 'sma25': sma_slow, 'sma99': sma_third, 'sma200': sma_extra_val
+        }.get(sma_choice, sma_slow)
+
         sma_pct = (price - sma_value) / sma_value * 100
+
+        # === RSI and MACD ===
         rsi = compute_rsi(closes)
-        # rsi7 scalping
         rsi_6 = compute_rsi(closes, period=6)
-
-        if filter_type == "sma7x25x99":
-            if trend == "bullish" and not (sma7 > sma25 and sma7 > sma99  and sma7_prev <= sma99_prev and rsi >= 52):return None
-            if trend == "bearish" and not (sma7 < sma25 and sma7 < sma99  and sma7_prev >= sma99_prev and rsi <= 48):return None
-        elif filter_type == "smapercent":
-            if sma_min is None or sma_max is None: return None
-            if trend == "bullish" and not (sma_min <= sma_pct <= sma_max and rsi >= 52): return None
-            if trend == "bearish" and not (-sma_max <= sma_pct <= -sma_min and rsi <= 48): return None
-        elif filter_type == "smacrossover":
-            if trend == "bullish" and not (sma7 > sma25 and sma7_prev <= sma25_prev ): return None
-            if trend == "bearish" and not (sma7 < sma25 and sma7_prev >= sma25_prev ): return None
-
         macd_val, signal_val = calculate_macd(closes)
         macd_state = "🟢 Bullish" if macd_val > signal_val else "🔴 Bearish"
+        cluster_label = "None"  # Default in case no cluster logic applies
 
-       # MACD-6 Crossover Tracker (last up to 30 candles)
+
+        # === Filter Logic ===
+        if filter_type == "sma7x25x99":
+            if trend == "bullish" and not (
+                sma_fast > sma_slow and sma_fast > sma_third and sma_fast_prev <= sma_third_prev and macd_val > signal_val
+            ): return None
+            if trend == "bearish" and not (
+                sma_fast < sma_slow and sma_fast < sma_third and sma_fast_prev >= sma_third_prev and macd_val < signal_val
+            ): return None
+
+        elif filter_type == "smapercent":
+            if sma_min is None or sma_max is None:
+                return None
+            if trend == "bullish" and not (sma_min <= sma_pct <= sma_max and rsi_6 >= 40):
+                return None
+            if trend == "bearish" and not (-sma_max <= sma_pct <= -sma_min and rsi_6 <= 30):
+                return None
+
+        elif filter_type == "smacrossover":
+            if trend == "bullish" and not (sma_fast > sma_slow and sma_fast_prev <= sma_slow_prev and macd_val > signal_val):
+                return None
+            if trend == "bearish" and not (sma_fast < sma_slow and sma_fast_prev >= sma_slow_prev and macd_val < signal_val):
+                return None
+
+        elif filter_type == "smacluster":
+            sma7 = pd.Series(closes).rolling(window=7).mean().iloc[-1]
+            sma25 = pd.Series(closes).rolling(window=25).mean().iloc[-1]
+            sma99 = pd.Series(closes).rolling(window=99).mean().iloc[-1]
+
+            sma_max = max(sma7, sma25, sma99)
+            sma_min = min(sma7, sma25, sma99)
+            sma_spread = (sma_max - sma_min) / sma_min * 100
+
+            compression_threshold_map = {
+                "5m": 0.5, "15m": 0.75, "1h": 1.0, "4h": 1.0, "1d": 1.2
+            }
+            breakout_range_map = {
+                "5m": 0.001, "15m": 0.002, "1h": 0.003, "4h": 0.004, "1d": 0.01
+            }
+            compression_threshold = compression_threshold_map.get(interval, 1.0)
+            breakout_range = breakout_range_map.get(interval, 0.004)
+
+            clustered = sma_spread <= compression_threshold
+            price_above_cluster = price > sma_max and (price - sma_max) <= breakout_range * price
+            price_below_cluster = price < sma_min and (sma_min - price) <= breakout_range * price
+
+            if trend == "bullish":
+                if not (clustered and price_above_cluster):
+                    return None
+                cluster_label = f"✅ Bullish Breakout ({interval})"
+            elif trend == "bearish":
+                if not (clustered and price_below_cluster):
+                    return None
+                cluster_label = f"✅ Bearish Breakout ({interval})"
+            else:
+                cluster_label = "🔴 No Breakout"
+
+        # === MACD-6 Cross Tracker ===
         macd_series_6 = pd.Series(closes).ewm(span=6).mean() - pd.Series(closes).ewm(span=13).mean()
         signal_series_6 = macd_series_6.ewm(span=6).mean()
         macd_cross_label = "⚪"
-        max_lookback = 30
-
-        for i in range(1, max_lookback):
+        for i in range(1, 30):
             macd_now = macd_series_6.iloc[-i]
             signal_now = signal_series_6.iloc[-i]
             macd_prev = macd_series_6.iloc[-(i + 1)]
             signal_prev = signal_series_6.iloc[-(i + 1)]
-
             if macd_now > signal_now and macd_prev <= signal_prev:
                 macd_cross_label = f"🟢 ({i}c ago)"
                 break
@@ -239,15 +350,46 @@ def process_symbol(symbol, interval, market, filter_type, trend, sma_min=None, s
                 macd_cross_label = f"🔴 ({i}c ago)"
                 break
 
+        # === Volume Analysis ===
         volume_trend, volume_price_div = analyze_volume(volumes, closes)
+
+        # === Multi-Timeframe RSI and MACD ===
         rsi_info, macd_info = analyze_multi_tf(symbol, market)
+
+        # === ADX Calculation ===
         adx = calculate_adx(highs, lows, closes)
-        score = sum([macd_val > signal_val, rsi > 52, sma7 > sma25, volume_trend == "Increasing", adx > 25])
-        return (symbol, price, sma_pct, rsi, rsi_6, sma7, sma25, sma50, sma99, sma200, macd_state,
-                macd_cross_label, volume_trend, volume_price_div, rsi_info, macd_info, adx, score)
+
+        # === ATR Calculation ===
+        atr_period_map = {"5m": 7, "15m": 7, "1h": 10, "4h": 10, "1d": 10}
+        atr_period = atr_period_map.get(interval, 14)
+        atr = calculate_atr(highs, lows, closes, period=atr_period)
+        if atr < 0.002:
+            return None
+
+        atr_dot = "🟢"
+
+        # === Signal Score ===
+        score = sum([
+            macd_val > signal_val,
+            rsi > 52,
+            sma_fast > sma_slow,
+            volume_trend == "Increasing",
+            adx > 25
+        ])
+
+        # === Return Result ===
+        return (
+            symbol, price, sma_pct, rsi, rsi_6, sma_fast, sma_slow,
+            sma_third, sma_extra_val, None,
+            macd_state, macd_cross_label, volume_trend, volume_price_div,
+            rsi_info, macd_info, adx, score, atr, atr_dot, cluster_label
+        )
+
     except Exception as e:
         print(f"Error processing {symbol}: {e}")
         return None
+
+
 
 def analyze_volume(volumes, closes):
     avg_vol_7 = pd.Series(volumes).rolling(window=7).mean().iloc[-2]
@@ -277,33 +419,47 @@ def get_filtered_results(interval, market, filter_type, trend, sma_min=None, sma
     return sorted(results, key=lambda x: abs(x[2]))
 
 # --- Format Results --- 
-def format_results(data, interval, market):
+def format_results(data, interval, market, filter_type=None, trend=None):
     btc_header = get_btc_header()
-    header = f"*{interval.upper()} {market.title()} Filtered Results*\n"
+    filter_info = ""
+    if filter_type and trend:
+        filter_info = f" - {filter_type.upper()} {trend.title()}"
+        header = f"*{interval.upper()} {market.title()} Filtered Results{filter_info}*\n"
+
     chunks = []
     body = ""
+    # Set timezone offset for your region (e.g., +2 for CET)
+    TZ_OFFSET = 2
+    now_utc = datetime.utcnow()
+    local_time = now_utc + timedelta(hours=TZ_OFFSET)
+    formatted_time = local_time.strftime('%H:%M')
 
     for idx, (sym, pr, sma_pct, rsi, rsi_6, sma7, sma25, sma50, sma99, sma200,macd_state, macd_cross_label,
-              volume_trend, volume_price_div, rsi_info, macd_info, adx, score) in enumerate(data):
+              volume_trend, volume_price_div, rsi_info, macd_info, adx, score, atr, atr_dot, cluster_label) in enumerate(data):
         
         # We only add Multi-TF RSI and MACD for timeframes other than 15m
         rsi_line = ", ".join([f"RSI={r[1]} {r[2]} {r[0]}" if r[1] else f"RSI=NA {r[2]} {r[0]}" for r in rsi_info if r[0] != '15m'])
         macd_line = ", ".join([f"MACD={m[1]} {m[0]}" for m in macd_info if m[0] != '15m'])
 
         body += f"""
-📈 *{sym}*
+📈 *{sym}({interval}-{formatted_time})*
+• SMA Cluster: {cluster_label}
 • Price: `${pr:,.4f}`
-• SMA% from SMA25: `{sma_pct:+.2f}%`
-#RSi-6/MACD-6 used only for scalping
-• RSI-6: `{rsi_6:.1f}`{"🟢" if rsi_6 <= 30 else "🔴" if rsi_6 >= 70 else "⚪"}
+• SMA% diff: `{sma_pct:+.2f}%`
+#RSi-6/MACD-6 used only for scalping--
+• RSI-6: `{rsi_6:.1f}` {"🟢" if rsi_6 <= 30 else "🔴" if rsi_6 >= 70 else "⚪"}
 • MACD-6: {macd_cross_label}
 • Volume Trend: {volume_trend}
 • Price/Volume: {volume_price_div}
 • ADX Strength: `{adx:.1f}` {"🟢" if adx > 25 else "🔴"}
-#Multi TF calculate on the basis of rsi-14 and MACD normal
+#Multi TF calculate on the basis of rsi-14 and MACD normal--
 • 📊 Trend Score: `{score}/5` {"🟢 Strong" if score >= 4 else "🟡 Moderate" if score == 3 else "🔴 Weak"}
-• Multi-TF RSI: {rsi_line}
-• Multi-TF MACD: {macd_line}
+• Multi-TF: {rsi_line}
+• Multi-TF: {macd_line}
+• • ATR: `{atr:.4f}` {atr_dot}
+• SL (LONG): `{pr - (atr * 1.5):.4f}`
+• SL (SHORT): `{pr + (atr * 1.5):.4f}`
+
 ---------------
 """
 
@@ -327,6 +483,7 @@ def start(update: Update, context: CallbackContext):
         [InlineKeyboardButton("SMA% Difference", callback_data='filtertype_smapercent')],
         [InlineKeyboardButton("SMA7/SMA25 Crossover", callback_data='filtertype_smacrossover')],
         [InlineKeyboardButton("SMA7/SMA25/SMA99 Crossover", callback_data='filtertype_sma7x25x99')],
+        [InlineKeyboardButton("📐 SMA Cluster Breakout", callback_data='filtertype_smacluster')],
         [InlineKeyboardButton("🗑️ Clear Chat", callback_data='clearchat')],
     ]
     update.message.reply_text(
@@ -362,7 +519,11 @@ def set_filter_type(update: Update, context: CallbackContext):
             parse_mode=ParseMode.MARKDOWN)
         show_bull_bear_buttons(query, filter_type)
         return
-    
+    elif filter_type == "smacluster":
+        query.edit_message_text(
+            "📈 Select trend direction (Bullish or Bearish):",
+            parse_mode=ParseMode.MARKDOWN
+        )
     show_bull_bear_buttons(query, filter_type)
 
 
@@ -380,6 +541,7 @@ def handle_sma_percent_input(update: Update, context: CallbackContext):
         user_filter["sma_max"] = sma_max
         user_filters[user_id] = user_filter
         keyboard = [
+            [InlineKeyboardButton("SMA5", callback_data='smaoption_sma5')],
             [InlineKeyboardButton("SMA7", callback_data='smaoption_sma7')],
             [InlineKeyboardButton("SMA25", callback_data='smaoption_sma25')],
             [InlineKeyboardButton("SMA50", callback_data='smaoption_sma50')],
@@ -424,6 +586,7 @@ def set_trend(update: Update, context: CallbackContext):
      InlineKeyboardButton("1h Futures", callback_data='1h_futures'), InlineKeyboardButton("4h Futures", callback_data='4h_futures'), InlineKeyboardButton("1d Futures", callback_data='1d_futures')]
 ]
 
+
     query.edit_message_text(f"✅ Setup set to *{trend.title()}*. Choose timeframe & market:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
 def handle_analysis(update: Update, context: CallbackContext):
@@ -448,7 +611,7 @@ def handle_analysis(update: Update, context: CallbackContext):
         query.message.reply_text(f"❌ No matches for {interval.upper()} {market} [{trend}].")
         return
 
-    messages = format_results(results, interval, market)
+    messages = format_results(results, interval, market, filter_type, trend)
     for msg in messages:
         query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
